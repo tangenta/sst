@@ -207,6 +207,8 @@ object SSTEngine {
 
     readChannel.position(lower)
     assert(readChannel.read(byteBuffer) == byteBuffer.array().length)
+    readChannel.close()
+
     byteBuffer.position(0)
     byteBuffer
   }
