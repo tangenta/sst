@@ -10,15 +10,8 @@ import scala.collection.mutable.ArrayBuffer
 class SSTEngine {
   import SSTEngine._
 
-  case class SSTable(path: Path, sparseIndexTree: TreeMap[Key, Offset]) {
-    override def equals(obj: Any): Boolean = AnyRef.equals(obj)
-    override def hashCode(): Offset = AnyRef.hashCode()
-  }
-  case class State(segmentFiles: List[SSTable], memtable: TreeMap[Key, Value]) {
-    override def equals(obj: Any): Boolean = AnyRef.equals(obj)
-    override def hashCode(): Offset = AnyRef.hashCode()
-  }
-
+  case class SSTable(path: Path, sparseIndexTree: TreeMap[Key, Offset])
+  case class State(segmentFiles: List[SSTable], memoryTable: TreeMap[Key, Value])
 
   trait Event
   case class SetKeyValueEvent(key: Key, value: Value) extends Event
@@ -63,20 +56,16 @@ class SSTEngine {
   }
 
   def get(key: Key): Option[Value] = {
-    val stateSnapshot = state
-    // TODO: change to real sparse index trees
-    val result = stateSnapshot.memtable.get(key).orElse {
-      stateSnapshot.segmentFiles.dropWhile(!_.sparseIndexTree.contains(key)).headOption.map {
-        case SSTable(path, indexTree) =>
-          val byteArray = Files.readAllBytes(path)
-          val byteBuffer = ByteBuffer.wrap(byteArray)
-          val offset: Int = indexTree(key)
-          val keyLength = byteBuffer.getInt(offset)
-          val keyString = new String(byteArray, offset + 4, keyLength, UTF_8)
-          val valueLength = byteBuffer.getInt(offset + 4 + keyLength)
-          val valueString = new String(byteArray, offset + 4 + keyLength + 4, valueLength, UTF_8)
-          assert(keyString == key)
-          valueString
+    val State(segmentFiles, memoryTable) = state
+
+    val result = memoryTable.get(key).orElse {
+      segmentFiles.dropWhile {
+        case SSTable(path, iTree) =>
+          searchKey(key, path, iTree).isEmpty
+      }.headOption.flatMap {
+        case SSTable(path, iTree) =>
+          // TODO: optimize -- additional searching
+          searchKey(key, path, iTree)
       }
     }
     if (result.contains(tombstone)) None
@@ -136,10 +125,10 @@ class SSTEngine {
         // TODO: break the limitation of exclusively setting and compacting
         eventQueue.take() match {
           case SetKeyValueEvent(key, value) =>
-            state = State(state.segmentFiles, state.memtable.updated(key, value))
-            if (state.memtable.size >= avlTreeSize) {
-              val path = writeAsFile(convertBytes(state.memtable))
-              val indexTree = convertIndexTree(state.memtable)
+            state = State(state.segmentFiles, state.memoryTable.updated(key, value))
+            if (state.memoryTable.size >= avlTreeSize) {
+              val path = writeAsFile(convertBytes(state.memoryTable))
+              val indexTree = convertIndexTree(state.memoryTable)
               state = State(SSTable(path, indexTree) :: state.segmentFiles, TreeMap.empty)
             }
           case CompactEvent(files) =>
@@ -158,7 +147,7 @@ class SSTEngine {
               val newFilePath = writeAsFile(arrayBuffer.toArray)
               state = State(
                 SSTable(newFilePath, compressedIndexTree) :: state.segmentFiles.filter(s => !files.contains(s.path)),
-                state.memtable
+                state.memoryTable
               )
               files.foreach(Files.delete)
             }
@@ -209,23 +198,50 @@ object SSTEngine {
     ret
   }
 
-  private def searchKey(key: Key, lowerBound: Offset, upperBound: Offset, inFile: Path): Option[Value] = {
-    val readBuffer = ByteBuffer.allocate(upperBound - lowerBound)
-    val channel = Files.newByteChannel(inFile, StandardOpenOption.READ)
-    channel.position(lowerBound)
-    assert(channel.read(readBuffer) == readBuffer.array().length)
+  private def extractByteArray(path: Path, from: Option[Offset], to: Option[Offset]): ByteBuffer = {
+    val lower = from.getOrElse(0)
+    val upper = to.getOrElse(Files.size(path).toInt)
+
+    val readChannel = Files.newByteChannel(path, StandardOpenOption.READ)
+    val byteBuffer = ByteBuffer.allocate(upper - lower)
+
+    readChannel.position(lower)
+    assert(readChannel.read(byteBuffer) == byteBuffer.array().length)
+    byteBuffer.position(0)
+    byteBuffer
+  }
+
+  private def searchKey(key: Key, inBuffer: ByteBuffer): Option[Value] = {
+    val buf = inBuffer
     var result: Option[Value] = None
-    while (readBuffer.hasRemaining && result.isEmpty) {
-      val k = readByteBuffer(readBuffer)
-      val v = readByteBuffer(readBuffer)
+    while (buf.hasRemaining && result.isEmpty) {
+      val k = readByteBuffer(buf)
+      val v = readByteBuffer(buf)
       if (key == k) result = Some(v)
     }
     result
   }
 
+  private def searchKey(key: Key, segmentFile: Path, indexTree: TreeMap[Key, Offset]): Option[Value] = {
+    indexTree.get(key) match {
+      case lower@Some(_) =>
+        val iter = indexTree.valuesIteratorFrom(key)
+        iter.next() // forward iterator
+        val upper = if (iter.hasNext) Some(iter.next) else None
+        searchKey(key, extractByteArray(segmentFile, lower, upper))
+      case None =>
+        val lower = indexTree.to(key).lastOption.map(_._2)
+        val upper = indexTree.from(key).headOption.map(_._2)
+        searchKey(key, extractByteArray(segmentFile, lower, upper))
+    }
+  }
+
   private def compressIndexTree(origin: TreeMap[Key, Offset], ratio: Int): TreeMap[Key, Offset] = {
-    origin.foldLeft((TreeMap.empty[Key, Offset], 0)) { case ((result, index), elem) =>
-      (if (index % ratio == 0) result else result + elem, index + 1)
+    origin.foldLeft((TreeMap.empty[Key, Offset], 0)) {
+      case ((result, index), elem) =>
+        if (index % ratio == 0) (result, index + 1)
+        else (result + elem, index + 1)
     }._1
   }
+
 }
